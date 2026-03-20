@@ -1,0 +1,2 @@
+genie-tts
+python-dotenv

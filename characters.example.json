@@ -1,0 +1,18 @@
+[
+  {
+    "_comment": "--- Example 1: predefined built-in character (no model files needed) ---",
+    "character_name": "mika",
+    "predefined": true
+  },
+  {
+    "_comment": "--- Example 2: custom GPT-SoVITS character converted to ONNX ---",
+    "character_name": "my-char",
+    "onnx_model_dir": "/path/to/onnx/my-char",
+    "language": "jp",
+    "reference_audio": {
+      "audio_path": "/path/to/reference.wav",
+      "audio_text": "The text spoken in the reference audio",
+      "language": "jp"
+    }
+  }
+]
