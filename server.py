@@ -10,6 +10,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,10 +34,16 @@ log = logging.getLogger(__name__)
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8100"))
 CHARACTERS_FILE = Path(os.getenv("CHARACTERS_FILE", "characters.json"))
+IDLE_UNLOAD_SECONDS = int(os.getenv("IDLE_UNLOAD_SECONDS", "600"))
+JANITOR_INTERVAL_SECONDS = int(os.getenv("JANITOR_INTERVAL_SECONDS", "30"))
+MAX_LOADED_CHARACTERS = int(os.getenv("MAX_LOADED_CHARACTERS", "1"))
 
 # Genie internal state is shared, so guard calls.
 GENIE_LOCK = threading.RLock()
+CHARACTER_CONFIGS: dict[str, dict] = {}
 AVAILABLE_CHARACTERS: list[str] = []
+LOADED_CHARACTERS: set[str] = set()
+LAST_USED_AT: dict[str, float] = {}
 
 
 class ApiError(Exception):
@@ -59,58 +66,109 @@ def _read_characters_config() -> list[dict]:
     return data
 
 
-def preload_characters() -> None:
-    global AVAILABLE_CHARACTERS
+def load_character_catalog() -> None:
+    global AVAILABLE_CHARACTERS, CHARACTER_CONFIGS
     configured = _read_characters_config()
-    loaded: list[str] = []
+    catalog: dict[str, dict] = {}
 
     for char in configured:
         name = char.get("character_name")
         if not name:
             log.error("Skipping character with missing character_name")
             continue
+        if name in catalog:
+            log.error("Skipping duplicate character_name in config: %s", name)
+            continue
+        catalog[name] = char
 
+    CHARACTER_CONFIGS = catalog
+    AVAILABLE_CHARACTERS = sorted(catalog.keys())
+    log.info("Loaded character catalog: %d character(s)", len(AVAILABLE_CHARACTERS))
+
+
+def _load_character_locked(character_name: str) -> None:
+    char = CHARACTER_CONFIGS.get(character_name)
+    if not char:
+        raise ApiError(404, f"unknown character: {character_name}")
+
+    if character_name in LOADED_CHARACTERS:
+        LAST_USED_AT[character_name] = time.time()
+        return
+
+    # Enforce a load cap with LRU eviction before loading a new character.
+    if MAX_LOADED_CHARACTERS > 0 and len(LOADED_CHARACTERS) >= MAX_LOADED_CHARACTERS:
+        lru_name = min(LOADED_CHARACTERS, key=lambda n: LAST_USED_AT.get(n, 0.0))
+        try:
+            _unload_character_locked(lru_name)
+            log.info("Evicted least-recently-used character: %s", lru_name)
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(503, f"failed to evict loaded character {lru_name}: {exc}") from exc
+
+    if char.get("predefined"):
+        genie.load_predefined_character(character_name)
+    else:
+        genie.load_character(
+            character_name=character_name,
+            onnx_model_dir=char["onnx_model_dir"],
+            language=char["language"],
+        )
+
+    if ref := char.get("reference_audio"):
+        genie.set_reference_audio(
+            character_name=character_name,
+            audio_path=ref["audio_path"],
+            audio_text=ref["audio_text"],
+            language=ref.get("language") or char.get("language"),
+        )
+
+    LOADED_CHARACTERS.add(character_name)
+    LAST_USED_AT[character_name] = time.time()
+    log.info("Character loaded on demand: %s", character_name)
+
+
+def _unload_character_locked(character_name: str) -> None:
+    if character_name not in LOADED_CHARACTERS:
+        return
+
+    genie.unload_character(character_name=character_name)
+    LOADED_CHARACTERS.discard(character_name)
+    LAST_USED_AT.pop(character_name, None)
+    log.info("Character unloaded due to idle timeout: %s", character_name)
+
+
+def janitor_unload_idle_characters() -> None:
+    while True:
+        time.sleep(JANITOR_INTERVAL_SECONDS)
+        cutoff = time.time() - IDLE_UNLOAD_SECONDS
         try:
             with GENIE_LOCK:
-                if char.get("predefined"):
-                    genie.load_predefined_character(name)
-                else:
-                    genie.load_character(
-                        character_name=name,
-                        onnx_model_dir=char["onnx_model_dir"],
-                        language=char["language"],
-                    )
-
-                if ref := char.get("reference_audio"):
-                    genie.set_reference_audio(
-                        character_name=name,
-                        audio_path=ref["audio_path"],
-                        audio_text=ref["audio_text"],
-                        language=ref.get("language") or char.get("language"),
-                    )
-
-            loaded.append(name)
-            log.info("Character ready: %s", name)
+                to_unload = [
+                    name for name in LOADED_CHARACTERS if LAST_USED_AT.get(name, 0.0) < cutoff
+                ]
+                for name in to_unload:
+                    try:
+                        _unload_character_locked(name)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("Failed to unload character %s: %s", name, exc)
         except Exception as exc:  # noqa: BLE001
-            log.error("Failed to preload character %s: %s", name, exc)
-
-    AVAILABLE_CHARACTERS = loaded
-    log.info("Preload completed: %d character(s)", len(AVAILABLE_CHARACTERS))
+            log.error("Idle janitor loop failed: %s", exc)
 
 
 def synthesize_wav(character_name: str, text: str, split_sentence: bool) -> bytes:
-    if character_name not in AVAILABLE_CHARACTERS:
-        raise ApiError(404, f"character not loaded: {character_name}")
+    if character_name not in CHARACTER_CONFIGS:
+        raise ApiError(404, f"unknown character: {character_name}")
 
     tmp_wav = Path(tempfile.gettempdir()) / f"genie-tts-{uuid.uuid4().hex}.wav"
     try:
         with GENIE_LOCK:
+            _load_character_locked(character_name)
             genie.tts(
                 character_name=character_name,
                 text=text,
                 split_sentence=split_sentence,
                 save_path=str(tmp_wav),
             )
+            LAST_USED_AT[character_name] = time.time()
 
         if not tmp_wav.exists():
             raise ApiError(500, "TTS did not produce an output file")
@@ -158,11 +216,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/characters":
-            self._json(200, {"characters": AVAILABLE_CHARACTERS})
+            with GENIE_LOCK:
+                loaded = sorted(LOADED_CHARACTERS)
+            self._json(
+                200,
+                {
+                    "characters": AVAILABLE_CHARACTERS,
+                    "loaded": loaded,
+                    "max_loaded": MAX_LOADED_CHARACTERS,
+                },
+            )
             return
 
         if self.path == "/health":
-            self._json(200, {"status": "ok"})
+            with GENIE_LOCK:
+                loaded_count = len(LOADED_CHARACTERS)
+            self._json(
+                200,
+                {
+                    "status": "ok",
+                    "loaded_count": loaded_count,
+                    "max_loaded": MAX_LOADED_CHARACTERS,
+                },
+            )
             return
 
         self._json(404, {"error": "not found"})
@@ -200,7 +276,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    preload_characters()
-    log.info("Starting read-only Genie API on %s:%d", HOST, PORT)
+    load_character_catalog()
+    threading.Thread(target=janitor_unload_idle_characters, daemon=True).start()
+    log.info(
+        "Starting read-only Genie API on %s:%d (idle unload: %ds)",
+        HOST,
+        PORT,
+        IDLE_UNLOAD_SECONDS,
+    )
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.serve_forever()
