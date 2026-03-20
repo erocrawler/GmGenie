@@ -1,4 +1,6 @@
 characters.json
 .env
+.venv/
 data/
 GenieData/
+CharacterModels/
