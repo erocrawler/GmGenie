@@ -5,9 +5,12 @@ Public endpoints:
 - POST /tts       : Generate and return WAV audio.
 """
 
+import io
 import json
 import logging
 import os
+import re
+import struct
 import tempfile
 import threading
 import time
@@ -44,6 +47,36 @@ CHARACTER_CONFIGS: dict[str, dict] = {}
 AVAILABLE_CHARACTERS: list[str] = []
 LOADED_CHARACTERS: set[str] = set()
 LAST_USED_AT: dict[str, float] = {}
+
+
+# ---------------------------------------------------------------------------
+# Sentence splitting and WAV assembly helpers
+# ---------------------------------------------------------------------------
+
+_SENTENCE_RE = re.compile(r'(?<=[。！？…\u2026.!?])\s*')
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text on CJK/ASCII sentence-ending punctuation."""
+    parts = _SENTENCE_RE.split(text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _wav_to_pcm(wav_bytes: bytes) -> tuple[bytes, tuple[int, int, int]]:
+    """Return (pcm_frames, (channels, sampwidth, framerate)) parsed from WAV bytes."""
+    with wave.open(io.BytesIO(wav_bytes)) as wf:
+        return wf.readframes(wf.getnframes()), (wf.getnchannels(), wf.getsampwidth(), wf.getframerate())
+
+
+def _build_wav_header(channels: int, sampwidth: int, framerate: int, data_size: int = 0xFFFFFFFF) -> bytes:
+    """Build a 44-byte WAV header. data_size=0xFFFFFFFF produces a streaming/open-ended WAV."""
+    riff_size = (36 + data_size) if data_size != 0xFFFFFFFF else 0xFFFFFFFF
+    return (
+        struct.pack('<4sI4s', b'RIFF', riff_size, b'WAVE')
+        + struct.pack('<4sIHHIIHH', b'fmt ', 16, 1, channels, framerate,
+                      framerate * channels * sampwidth, channels * sampwidth, sampwidth * 8)
+        + struct.pack('<4sI', b'data', data_size)
+    )
 
 
 class ApiError(Exception):
@@ -154,25 +187,18 @@ def janitor_unload_idle_characters() -> None:
             log.error("Idle janitor loop failed: %s", exc)
 
 
-def synthesize_wav(character_name: str, text: str, split_sentence: bool) -> bytes:
-    if character_name not in CHARACTER_CONFIGS:
-        raise ApiError(404, f"unknown character: {character_name}")
-
+def _synthesize_sentence_locked(character_name: str, text: str) -> bytes:
+    """Synthesise one sentence and return its WAV bytes. Caller must hold GENIE_LOCK."""
     tmp_wav = Path(tempfile.gettempdir()) / f"genie-tts-{uuid.uuid4().hex}.wav"
     try:
-        with GENIE_LOCK:
-            _load_character_locked(character_name)
-            genie.tts(
-                character_name=character_name,
-                text=text,
-                split_sentence=split_sentence,
-                save_path=str(tmp_wav),
-            )
-            LAST_USED_AT[character_name] = time.time()
-
+        genie.tts(
+            character_name=character_name,
+            text=text,
+            split_sentence=False,
+            save_path=str(tmp_wav),
+        )
         if not tmp_wav.exists():
-            raise ApiError(500, "TTS did not produce an output file")
-
+            raise ApiError(500, f"TTS produced no output for: {text!r}")
         return tmp_wav.read_bytes()
     finally:
         try:
@@ -180,6 +206,32 @@ def synthesize_wav(character_name: str, text: str, split_sentence: bool) -> byte
                 tmp_wav.unlink()
         except OSError:
             pass
+
+
+def synthesize_wav(character_name: str, text: str, split_sentence: bool) -> bytes:
+    if character_name not in CHARACTER_CONFIGS:
+        raise ApiError(404, f"unknown character: {character_name}")
+
+    sentences = _split_sentences(text) if split_sentence else [text]
+    if not sentences:
+        sentences = [text]
+
+    pcm_chunks: list[bytes] = []
+    wav_params: tuple[int, int, int] | None = None
+
+    with GENIE_LOCK:
+        _load_character_locked(character_name)
+        for sentence in sentences:
+            wav_bytes = _synthesize_sentence_locked(character_name, sentence)
+            pcm, params = _wav_to_pcm(wav_bytes)
+            pcm_chunks.append(pcm)
+            if wav_params is None:
+                wav_params = params
+        LAST_USED_AT[character_name] = time.time()
+
+    combined_pcm = b''.join(pcm_chunks)
+    channels, sampwidth, framerate = wav_params or (1, 2, 32000)
+    return _build_wav_header(channels, sampwidth, framerate, len(combined_pcm)) + combined_pcm
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -214,6 +266,73 @@ class Handler(BaseHTTPRequestHandler):
 
         return payload
 
+    # ------------------------------------------------------------------
+    # Streaming helpers (chunked transfer encoding)
+    # ------------------------------------------------------------------
+
+    def _write_chunk(self, data: bytes) -> None:
+        self.wfile.write(f'{len(data):x}\r\n'.encode())
+        self.wfile.write(data)
+        self.wfile.write(b'\r\n')
+        self.wfile.flush()
+
+    def _end_chunks(self) -> None:
+        self.wfile.write(b'0\r\n\r\n')
+        self.wfile.flush()
+
+    def _handle_tts_stream(self, payload: dict) -> None:
+        """POST /tts/stream — synthesise sentence-by-sentence and stream WAV via chunked encoding.
+
+        Keeps the upstream connection alive so CF Tunnel (and other proxies) do not
+        time out with 524 on long texts.  The client receives a valid streaming WAV
+        (RIFF size = 0xFFFFFFFF) that players and NapCat/ffmpeg handle correctly.
+        """
+        character_name = payload.get("character_name")
+        text = payload.get("text")
+        split_sentence = bool(payload.get("split_sentence", True))
+
+        if not isinstance(character_name, str) or not character_name:
+            raise ApiError(400, "character_name is required")
+        if not isinstance(text, str) or not text.strip():
+            raise ApiError(400, "text is required")
+        if character_name not in CHARACTER_CONFIGS:
+            raise ApiError(404, f"unknown character: {character_name}")
+
+        sentences = _split_sentences(text) if split_sentence else [text]
+        if not sentences:
+            sentences = [text]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        header_sent = False
+        try:
+            with GENIE_LOCK:
+                _load_character_locked(character_name)
+                for i, sentence in enumerate(sentences):
+                    log.info("[stream] sentence %d/%d: %r", i + 1, len(sentences), sentence[:60])
+                    wav_bytes = _synthesize_sentence_locked(character_name, sentence)
+                    pcm, params = _wav_to_pcm(wav_bytes)
+                    if not header_sent:
+                        self._write_chunk(_build_wav_header(*params))  # streaming WAV header
+                        header_sent = True
+                    self._write_chunk(pcm)
+                LAST_USED_AT[character_name] = time.time()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("[stream] error mid-stream")
+            if not header_sent:
+                raise  # let do_POST handle it as a proper JSON error
+            # Headers already sent — we can only terminate the stream abruptly
+            try:
+                self._end_chunks()
+            except Exception:
+                pass
+            return
+
+        self._end_chunks()
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/characters":
             with GENIE_LOCK:
@@ -244,6 +363,17 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/tts/stream":
+            try:
+                payload = self._read_json_body()
+                self._handle_tts_stream(payload)
+            except ApiError as exc:
+                self._json(exc.status, {"error": exc.message})
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Unhandled /tts/stream error")
+                self._json(500, {"error": str(exc)})
+            return
+
         if self.path != "/tts":
             self._json(404, {"error": "not found"})
             return
