@@ -57,11 +57,18 @@ LAST_USED_AT: dict[str, float] = {}
 
 _SENTENCE_RE = re.compile(r'(?<=[。！？…\u2026.!?])\s*')
 
+# Matches at least one CJK character, Latin letter, or digit — i.e. "has real words".
+_HAS_WORDS_RE = re.compile(
+    r'[\u4e00-\u9fff\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af'  # CJK / kana / hangul
+    r'a-zA-Z\u00C0-\u024F'                                      # Latin + extended Latin
+    r'0-9]',                                                     # digits
+)
+
 
 def _split_sentences(text: str) -> list[str]:
-    """Split text on CJK/ASCII sentence-ending punctuation."""
+    """Split text on CJK/ASCII sentence-ending punctuation, dropping emoji-only segments."""
     parts = _SENTENCE_RE.split(text.strip())
-    return [p.strip() for p in parts if p.strip()]
+    return [p.strip() for p in parts if p.strip() and _HAS_WORDS_RE.search(p)]
 
 
 def _wav_to_pcm(wav_bytes: bytes) -> tuple[bytes, tuple[int, int, int]]:
