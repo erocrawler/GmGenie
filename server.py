@@ -9,12 +9,14 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import struct
 import tempfile
 import threading
 import time
 import uuid
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -77,6 +79,20 @@ def _build_wav_header(channels: int, sampwidth: int, framerate: int, data_size: 
                       framerate * channels * sampwidth, channels * sampwidth, sampwidth * 8)
         + struct.pack('<4sI', b'data', data_size)
     )
+
+
+SENTENCE_PAUSE_MIN_MS = int(os.getenv("SENTENCE_PAUSE_MIN_MS", "200"))
+SENTENCE_PAUSE_MAX_MS = int(os.getenv("SENTENCE_PAUSE_MAX_MS", "500"))
+
+
+def _random_pause_ms() -> int:
+    return random.randint(SENTENCE_PAUSE_MIN_MS, SENTENCE_PAUSE_MAX_MS)
+
+
+def _silence_pcm(channels: int, sampwidth: int, framerate: int, duration_ms: int) -> bytes:
+    """Return silent PCM frames for the given duration."""
+    n_frames = int(framerate * duration_ms / 1000)
+    return b'\x00' * (n_frames * channels * sampwidth)
 
 
 class ApiError(Exception):
@@ -224,9 +240,11 @@ def synthesize_wav(character_name: str, text: str, split_sentence: bool) -> byte
         for sentence in sentences:
             wav_bytes = _synthesize_sentence_locked(character_name, sentence)
             pcm, params = _wav_to_pcm(wav_bytes)
-            pcm_chunks.append(pcm)
             if wav_params is None:
                 wav_params = params
+            else:
+                pcm_chunks.append(_silence_pcm(*wav_params, _random_pause_ms()))
+            pcm_chunks.append(pcm)
         LAST_USED_AT[character_name] = time.time()
 
     combined_pcm = b''.join(pcm_chunks)
@@ -318,6 +336,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not header_sent:
                         self._write_chunk(_build_wav_header(*params))  # streaming WAV header
                         header_sent = True
+                    else:
+                        self._write_chunk(_silence_pcm(*params, _random_pause_ms()))
                     self._write_chunk(pcm)
                 LAST_USED_AT[character_name] = time.time()
         except Exception as exc:  # noqa: BLE001
